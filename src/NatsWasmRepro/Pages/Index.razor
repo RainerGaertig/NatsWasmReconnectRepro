@@ -1,0 +1,158 @@
+@page "/"
+@using NATS.Client.Core
+@implements IAsyncDisposable
+@inject ILoggerFactory LoggerFactory
+
+<h1>NATS.Net WebAssembly reconnect freeze repro</h1>
+
+<p>
+    NATS WebSocket URL:
+    <input @bind="_url" style="width: 300px" />
+</p>
+
+<p>
+    <button @onclick="ConnectAsync" disabled="@(_connection != null)">1. Connect + subscribe</button>
+    <button @onclick="ForceReconnectAsync" disabled="@(_connection == null)">2a. NatsConnection.ReconnectAsync()</button>
+    <button @onclick="ReplaceConnectionAsync" disabled="@(_connection == null)">2b. New connection + dispose old</button>
+    <button @onclick="LoopReconnectAsync" disabled="@(_connection == null)">3a. Run 2a 20x</button>
+    <button @onclick="LoopReplaceAsync" disabled="@(_connection == null)">3b. Run 2b 20x</button>
+</p>
+
+<p>
+    Heartbeat (JS timer, every 250 ms). If it stops counting, the browser thread is frozen:
+    <strong id="heartbeat">0</strong>
+</p>
+
+<pre style="background: #eee; padding: 8px; height: 400px; overflow: auto">@string.Join("\n", _log)</pre>
+
+@code {
+    private readonly List<string> _log = new();
+    private string _url = "ws://localhost:8080";
+    private NatsConnection? _connection;
+    private CancellationTokenSource? _trafficCts;
+    private int _received;
+
+    private NatsConnection CreateConnection() => new(NatsOpts.Default with
+    {
+        Url = _url,
+        Name = "wasm-reconnect-repro",
+        LoggerFactory = LoggerFactory,
+    });
+
+    private Task ConnectAsync() => RunAsync("Connect", async () =>
+    {
+        _connection = CreateConnection();
+        await _connection.ConnectAsync();
+        StartTraffic(_connection);
+    });
+
+    // Variant A: public reconnect API of the same connection.
+    // NatsConnection.ReconnectAsync() disposes the socket while its read loop is receiving.
+    private Task ForceReconnectAsync() => RunAsync("ReconnectAsync", async () =>
+    {
+        await _connection!.ReconnectAsync();
+    });
+
+    // Variant B: what an app does on login/logout (new credentials):
+    // build a new connection, swap it in, then dispose the old one.
+    private Task ReplaceConnectionAsync() => RunAsync("Replace connection", async () =>
+    {
+        var next = CreateConnection();
+        await next.ConnectAsync();
+
+        var previous = _connection!;
+        _connection = next;
+        StartTraffic(next);
+
+        await previous.DisposeAsync();
+    });
+
+    private async Task LoopReconnectAsync()
+    {
+        for (var i = 1; i <= 20; i++)
+        {
+            Log($"Loop iteration {i}");
+            await ForceReconnectAsync();
+            await Task.Delay(300);
+        }
+    }
+
+    private async Task LoopReplaceAsync()
+    {
+        for (var i = 1; i <= 20; i++)
+        {
+            Log($"Loop iteration {i}");
+            await ReplaceConnectionAsync();
+            await Task.Delay(300);
+        }
+    }
+
+    // Keeps the read loop busy, so the socket is closed while data is being received.
+    private void StartTraffic(NatsConnection connection)
+    {
+        _trafficCts?.Cancel();
+        _trafficCts = new CancellationTokenSource();
+        var ct = _trafficCts.Token;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await foreach (var _ in connection.SubscribeAsync<string>("repro.ping", cancellationToken: ct))
+                {
+                    _received++;
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Log($"Subscription ended: {ex.GetType().Name}: {ex.Message}");
+            }
+        });
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    await connection.PublishAsync("repro.ping", "ping", cancellationToken: ct);
+                    await Task.Delay(20, ct);
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Log($"Publisher ended: {ex.GetType().Name}: {ex.Message}");
+            }
+        });
+    }
+
+    private async Task RunAsync(string name, Func<Task> action)
+    {
+        Log($"{name}: started (state={_connection?.ConnectionState}, received={_received})");
+        try
+        {
+            await action();
+            Log($"{name}: completed (state={_connection?.ConnectionState}, received={_received})");
+        }
+        catch (Exception ex)
+        {
+            Log($"{name}: failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private void Log(string message)
+    {
+        _log.Add($"{DateTime.Now:HH:mm:ss.fff} {message}");
+        Console.WriteLine(message);
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _trafficCts?.Cancel();
+        if (_connection != null)
+        {
+            await _connection.DisposeAsync();
+        }
+    }
+}
